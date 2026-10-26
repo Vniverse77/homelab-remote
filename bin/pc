@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# pc - power-control the home server from the laptop: on | off | restart | status
+# Part of homelab-remote. Config: ~/.config/homelab-remote/config
+set -uo pipefail
+
+CONFIG="${HOMELAB_CONFIG:-$HOME/.config/homelab-remote/config}"
+
+usage() {
+  cat <<EOF
+Usage: pc <command> [--yes] [--json]
+
+  on        Wake the server with Wake-on-LAN
+  off       Shut down the server (countdown + optional Ollama warning)
+  restart   Restart the server (countdown + optional Ollama warning)
+  status    Show whether the server is up (and loaded Ollama models)
+
+  --yes     Skip the countdown and warning
+  --json    Print status as JSON
+EOF
+}
+
+load_config() {
+  if [[ ! -r $CONFIG ]]; then
+    echo "Error: config not found at $CONFIG (see config.example)." >&2
+    exit 78
+  fi
+  # shellcheck source=/dev/null
+  source "$CONFIG"
+  local v
+  for v in SERVER_IP SERVER_USER SERVER_MAC LAN_BROADCAST CONTROL_KEY; do
+    if [[ -z ${!v:-} ]]; then
+      echo "Error: $v is not set in $CONFIG." >&2
+      exit 78
+    fi
+  done
+  BOOT_TIMEOUT="${BOOT_TIMEOUT:-150}"
+  DOWN_TIMEOUT="${DOWN_TIMEOUT:-90}"
+  COUNTDOWN="${COUNTDOWN:-10}"
+  OLLAMA_CHECK="${OLLAMA_CHECK:-yes}"
+  LOCK="${XDG_RUNTIME_DIR:-/tmp}/homelab-pc.lock"
+}
+
+remote() {
+  ssh -i "$CONTROL_KEY" -o BatchMode=yes -o ConnectTimeout=5 \
+      -o StrictHostKeyChecking=accept-new "$SERVER_USER@$SERVER_IP" "$1"
+}
+
+# Up = the restricted SSH key answers "pong" (server is usable).
+# Fallback: Tailscale ping with retries, which also covers early boot
+# before sshd has started. SSH also re-establishes a stale Tailscale path.
+is_up() {
+  [[ $(remote ping 2>/dev/null) == pong ]] && return 0
+  tailscale ping -c 3 --timeout=3s "$SERVER_IP" &>/dev/null
+}
+
+# Prints currently loaded Ollama models, one per line (empty if none)
+ollama_models() {
+  [[ $OLLAMA_CHECK == yes ]] || return 0
+  remote ollama-ps 2>/dev/null | python3 -c '
+import json, sys
+try:
+    for m in json.load(sys.stdin).get("models", []):
+        print(m.get("name", "?"))
+except Exception:
+    pass'
+}
+
+# $1 = up | down, $2 = timeout in seconds
+wait_for() {
+  local want=$1 limit=$2 start=$SECONDS
+  while (( SECONDS - start < limit )); do
+    if [[ $want == up ]] && is_up; then echo; return 0; fi
+    if [[ $want == down ]] && ! is_up; then echo; return 0; fi
+    printf '.'
+    sleep 4
+  done
+  echo
+  return 1
+}
+
+# Countdown + Ollama warning. Skipped with --yes.
+confirm() {
+  (( YES )) && return 0
+  local models
+  models=$(ollama_models)
+  if [[ -n $models ]]; then
+    echo "[!] Ollama has models loaded:"
+    while IFS= read -r m; do echo "    - $m"; done <<<"$models"
+  fi
+  echo "Server will $1 in $COUNTDOWN seconds. Press Ctrl+C to cancel."
+  local s
+  for (( s = COUNTDOWN; s > 0; s-- )); do
+    printf '\r   %2d ' "$s"
+    sleep 1
+  done
+  echo
+}
+
+take_lock() {
+  exec 9>"$LOCK"
+  if ! flock -n 9; then
+    echo "Error: another pc command is already running."
+    exit 75
+  fi
+}
+
+cmd_on() {
+  if is_up; then echo "Server is already up."; return 0; fi
+  if ! command -v wakeonlan >/dev/null; then
+    echo "Error: wakeonlan is not installed."
+    return 1
+  fi
+  echo "Sending magic packet to $SERVER_MAC"
+  local _
+  for _ in 1 2 3; do
+    wakeonlan -i "$LAN_BROADCAST" "$SERVER_MAC" >/dev/null
+    sleep 1
+  done
+  printf 'Waiting for the server to boot'
+  if wait_for up "$BOOT_TIMEOUT"; then
+    echo "Server is up."
+  else
+    echo "Error: no response after $BOOT_TIMEOUT seconds."
+    echo "Wake-on-LAN only works from the home LAN. Is Wake-on-LAN enabled in BIOS?"
+    return 1
+  fi
+}
+
+cmd_off() {
+  if ! is_up; then echo "Server is already off."; return 0; fi
+  confirm "shut down"
+  echo "Sending shutdown command..."
+  remote poweroff || true   # connection drop is expected
+  printf 'Waiting for the server to shut down'
+  if wait_for down "$DOWN_TIMEOUT"; then
+    echo "Server is off."
+  else
+    echo "Error: server is still responding. Check with 'pc status'."
+    return 1
+  fi
+}
+
+cmd_restart() {
+  if ! is_up; then echo "Server is off and cannot be restarted. Use 'pc on'."; return 1; fi
+  confirm "restart"
+  echo "Sending restart command..."
+  remote reboot || true
+  printf 'Waiting for the server to shut down'
+  wait_for down "$DOWN_TIMEOUT" || { echo "Error: server did not shut down."; return 1; }
+  printf 'Waiting for the server to boot'
+  if wait_for up "$BOOT_TIMEOUT"; then
+    echo "Server has restarted."
+  else
+    echo "Error: server did not come back. Try waking it with 'pc on'."
+    return 1
+  fi
+}
+
+cmd_status() {
+  local up=false models=""
+  if is_up; then up=true; models=$(ollama_models); fi
+
+  if (( JSON )); then
+    UP="$up" MODELS="$models" python3 -c '
+import json, os
+print(json.dumps({
+    "up": os.environ["UP"] == "true",
+    "models": [m for m in os.environ["MODELS"].splitlines() if m],
+}))'
+    return 0
+  fi
+
+  if [[ $up == true ]]; then
+    echo "Server is up ($SERVER_IP)"
+    if [[ $OLLAMA_CHECK == yes ]]; then
+      if [[ -n $models ]]; then
+        echo "Ollama models loaded:"
+        while IFS= read -r m; do echo "  - $m"; done <<<"$models"
+      else
+        echo "No Ollama models loaded."
+      fi
+    fi
+  else
+    echo "Server is off."
+  fi
+}
+
+# -- Arguments ---------------------------------------------------------
+ACTION="${1:-}"
+[[ $# -gt 0 ]] && shift
+YES=0
+JSON=0
+for arg in "$@"; do
+  case $arg in
+    -y|--yes) YES=1 ;;
+    --json)   JSON=1 ;;
+    *) usage; exit 2 ;;
+  esac
+done
+
+case $ACTION in
+  -h|--help|help) usage; exit 0 ;;
+  on|off|restart|status) ;;
+  *) usage; exit 2 ;;
+esac
+
+load_config
+trap 'echo; echo "Cancelled."; exit 130' INT
+
+case $ACTION in
+  on)      take_lock; cmd_on ;;
+  off)     take_lock; cmd_off ;;
+  restart) take_lock; cmd_restart ;;
+  status)  cmd_status ;;
+esac

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# pc-phone - SSH forced-command gate for the phone. Runs on the laptop.
+# Part of homelab-remote.
+#
+# The phone's SSH key may ONLY run this script (command= in authorized_keys).
+# It allows a fixed list of commands, and every command first asks for this
+# laptop's own login password (checked locally via sudo). Tapping a widget
+# on an unlocked phone therefore does nothing without the password.
+#
+# authorized_keys line (on the laptop):
+#   command="/home/<you>/.local/bin/pc-phone",restrict,pty ssh-ed25519 AAAA... phone
+
+BIN_DIR="$(dirname "$(readlink -f "$0")")"
+
+case "${SSH_ORIGINAL_COMMAND:-}" in
+  "pc on")         cmd=("$BIN_DIR/pc" on) ;;
+  "pc off")        cmd=("$BIN_DIR/pc" off) ;;
+  "pc restart")    cmd=("$BIN_DIR/pc" restart) ;;
+  "pc status")     cmd=("$BIN_DIR/pc" status) ;;
+  "camera on")     cmd=("$BIN_DIR/camera" on) ;;
+  "camera off")    cmd=("$BIN_DIR/camera" off) ;;
+  "camera status") cmd=("$BIN_DIR/camera" status) ;;
+  *)
+    echo "pc-phone: command not allowed: ${SSH_ORIGINAL_COMMAND:-<empty>}" >&2
+    echo "Allowed: pc on|off|restart|status, camera on|off|status" >&2
+    exit 1
+    ;;
+esac
+
+# Forget any cached sudo login, then require this laptop's password.
+# sudo allows 3 attempts and logs failures to the journal.
+sudo -k
+if ! sudo -v -p "$(hostname) password: "; then
+  echo "Wrong password. Nothing was done."
+  exit 1
+fi
+sudo -k
+
+exec "${cmd[@]}"

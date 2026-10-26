@@ -1,0 +1,6 @@
+# Never commit personal configuration or secrets
+config
+*.local
+camera/password
+*.pem
+id_*

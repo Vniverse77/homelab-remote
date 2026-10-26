@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# camera - stream this laptop's webcam (+ optional microphone) over Tailscale.
+# RTSP via mediamtx, password protected, auto-off after a timeout.
+# Part of homelab-remote. Config: ~/.config/homelab-remote/config
+set -uo pipefail
+
+CONFIG="${HOMELAB_CONFIG:-$HOME/.config/homelab-remote/config}"
+
+usage() {
+  cat <<EOF
+Usage: camera <command>
+
+  on [minutes]   start streaming (auto-off, default from config)
+  off            stop streaming
+  status         show state, time left and the VLC link
+
+The stream is only reachable over Tailscale and needs a password.
+EOF
+}
+
+load_config() {
+  if [[ -r $CONFIG ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG"
+  fi
+  CAMERA_DEVICE="${CAMERA_DEVICE:-/dev/video0}"
+  CAMERA_SIZE="${CAMERA_SIZE:-1280x720}"
+  CAMERA_FPS="${CAMERA_FPS:-15}"
+  CAMERA_INPUT_FORMAT="${CAMERA_INPUT_FORMAT:-mjpeg}"
+  CAMERA_AUDIO="${CAMERA_AUDIO:-yes}"
+  CAMERA_PORT="${CAMERA_PORT:-8554}"
+  CAMERA_DEFAULT_MINUTES="${CAMERA_DEFAULT_MINUTES:-30}"
+  CAMERA_MAX_MINUTES="${CAMERA_MAX_MINUTES:-720}"
+
+  STATE_DIR="$HOME/.config/homelab-remote/camera"
+  CONF="$STATE_DIR/mediamtx.yml"
+  CRED="$STATE_DIR/password"
+  UNTIL="${XDG_RUNTIME_DIR:-/tmp}/homelab-camera.until"
+  VIEWER="viewer"
+  SRV_UNIT="homelab-camera-rtsp"
+  ENC_UNIT="homelab-camera-stream"
+}
+
+ts_ip() { tailscale ip -4 2>/dev/null | head -n 1; }
+
+url() { echo "rtsp://$VIEWER:$(<"$CRED")@$(ts_ip):$CAMERA_PORT/cam"; }
+
+is_on() { systemctl --user is-active --quiet "$ENC_UNIT"; }
+
+# Creates the stream password once, and (re)writes the mediamtx config.
+# Only localhost may publish; viewers need the password.
+ensure_config() {
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+  if [[ ! -s $CRED ]]; then
+    ( umask 077; head -c 18 /dev/urandom | base64 | tr -d '/+=\n' > "$CRED" )
+  fi
+  local pw
+  pw=$(<"$CRED")
+  ( umask 077; cat > "$CONF" <<EOF
+logLevel: warn
+rtsp: yes
+rtspAddress: :$CAMERA_PORT
+rtmp: no
+hls: no
+webrtc: no
+srt: no
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: ['127.0.0.1/32', '::1/128']
+    permissions:
+      - action: publish
+        path: cam
+  - user: $VIEWER
+    pass: $pw
+    ips: []
+    permissions:
+      - action: read
+        path: cam
+paths:
+  cam:
+EOF
+  )
+}
+
+stop_units() {
+  systemctl --user stop "$ENC_UNIT" "$SRV_UNIT" 2>/dev/null
+  systemctl --user reset-failed "$ENC_UNIT" "$SRV_UNIT" 2>/dev/null
+  rm -f "$UNTIL"
+}
+
+cmd_on() {
+  local minutes="${1:-$CAMERA_DEFAULT_MINUTES}"
+  if ! [[ $minutes =~ ^[0-9]+$ ]] || (( minutes < 1 || minutes > CAMERA_MAX_MINUTES )); then
+    echo "Error: minutes must be between 1 and $CAMERA_MAX_MINUTES."
+    return 2
+  fi
+  if is_on; then
+    echo "Camera is already on."
+    cmd_status
+    return 0
+  fi
+  local dep
+  for dep in ffmpeg mediamtx tailscale; do
+    command -v "$dep" >/dev/null || { echo "Error: $dep is not installed."; return 1; }
+  done
+  if [[ ! -e $CAMERA_DEVICE ]]; then
+    echo "Error: $CAMERA_DEVICE not found. Is the webcam enabled?"
+    return 1
+  fi
+  if [[ -z $(ts_ip) ]]; then
+    echo "Error: Tailscale is not up on this laptop."
+    return 1
+  fi
+
+  ensure_config
+  stop_units
+  local secs=$(( minutes * 60 ))
+
+  systemd-run --user --quiet --unit="$SRV_UNIT" \
+    --property=RuntimeMaxSec=$(( secs + 30 )) \
+    mediamtx "$CONF" || { echo "Error: could not start mediamtx."; return 1; }
+  sleep 1
+
+  local audio=()
+  if [[ $CAMERA_AUDIO == yes ]]; then
+    audio=(-f pulse -i default)
+  fi
+  local audio_codec=(-an)
+  if [[ $CAMERA_AUDIO == yes ]]; then
+    audio_codec=(-c:a aac -b:a 64k -ar 44100)
+  fi
+
+  systemd-run --user --quiet --unit="$ENC_UNIT" \
+    --property=RuntimeMaxSec="$secs" \
+    ffmpeg -hide_banner -loglevel warning \
+      -f v4l2 -input_format "$CAMERA_INPUT_FORMAT" -framerate "$CAMERA_FPS" \
+      -video_size "$CAMERA_SIZE" -i "$CAMERA_DEVICE" \
+      "${audio[@]}" \
+      -c:v libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p \
+      -g $(( CAMERA_FPS * 2 )) -b:v 1500k \
+      "${audio_codec[@]}" \
+      -f rtsp -rtsp_transport tcp "rtsp://127.0.0.1:$CAMERA_PORT/cam" \
+    || { echo "Error: could not start ffmpeg."; stop_units; return 1; }
+
+  sleep 4
+  if ! is_on; then
+    echo "Error: the stream stopped right after starting. Last log lines:"
+    journalctl --user -u "$ENC_UNIT" -n 15 --no-pager
+    stop_units
+    return 1
+  fi
+
+  date -d "+$minutes minutes" +%s > "$UNTIL"
+  echo "Camera is ON. Auto-off in $minutes minutes."
+  echo "Open in VLC: $(url)"
+}
+
+cmd_off() {
+  stop_units
+  echo "Camera is OFF."
+}
+
+cmd_status() {
+  if is_on; then
+    local left=""
+    if [[ -s $UNTIL ]]; then
+      left=$(( ( $(<"$UNTIL") - $(date +%s) + 59 ) / 60 ))
+      left=" Auto-off in about $left minutes."
+    fi
+    echo "Camera is ON.$left"
+    echo "Open in VLC: $(url)"
+  else
+    echo "Camera is OFF."
+  fi
+}
+
+case "${1:-}" in
+  on)     load_config; cmd_on "${2:-}" ;;
+  off)    load_config; cmd_off ;;
+  status) load_config; cmd_status ;;
+  -h|--help|help) usage ;;
+  *)      usage; exit 2 ;;
+esac

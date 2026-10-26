@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# dev - attach to a persistent tmux session on the home server.
+# Part of homelab-remote. Config: ~/.config/homelab-remote/config
+set -uo pipefail
+
+CONFIG="${HOMELAB_CONFIG:-$HOME/.config/homelab-remote/config}"
+BIN_DIR="$(dirname "$(readlink -f "$0")")"
+
+usage() {
+  cat <<EOF
+Usage: dev [session | ls]
+
+Attach to a persistent tmux session on the home server, waking it first
+if needed. Sessions keep running after you disconnect, so coding agents
+and long jobs continue while the laptop is closed.
+
+  dev            attach to (or create) the "main" session
+  dev <name>     attach to (or create) another session, e.g. dev api
+  dev ls         list running sessions
+
+Detach without stopping anything: Ctrl+b, then d
+EOF
+}
+
+case "${1:-}" in
+  -h|--help|help) usage; exit 0 ;;
+esac
+
+if [[ ! -r $CONFIG ]]; then
+  echo "Error: config not found at $CONFIG (see config.example)." >&2
+  exit 78
+fi
+# shellcheck source=/dev/null
+source "$CONFIG"
+for v in SERVER_IP SERVER_USER DEV_KEY PROJECTS_DIR; do
+  if [[ -z ${!v:-} ]]; then
+    echo "Error: $v is not set in $CONFIG." >&2
+    exit 78
+  fi
+done
+
+ssh_cmd=(ssh -i "$DEV_KEY" -o ConnectTimeout=5)
+target="$SERVER_USER@$SERVER_IP"
+
+if [[ ${1:-} == ls ]]; then
+  exec "${ssh_cmd[@]}" "$target" tmux ls
+fi
+
+SESSION="${1:-main}"
+if ! [[ $SESSION =~ ^[A-Za-z0-9_-]+$ ]]; then
+  echo "Error: session names may only contain letters, digits, - and _." >&2
+  exit 2
+fi
+
+"$BIN_DIR/pc" on || exit 1
+
+if command -v mosh >/dev/null; then
+  exec mosh --ssh="${ssh_cmd[*]}" "$target" -- \
+    tmux new-session -A -s "$SESSION" -c "$PROJECTS_DIR"
+else
+  echo "mosh not found, falling back to ssh (the connection will drop on network changes)."
+  exec "${ssh_cmd[@]}" -t "$target" \
+    tmux new-session -A -s "$SESSION" -c "$PROJECTS_DIR"
+fi

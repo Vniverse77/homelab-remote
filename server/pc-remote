@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# pc-remote - SSH forced-command gate on the home SERVER.
+# Part of homelab-remote.
+#
+# The laptop's restricted control key may ONLY run this script (command= in
+# authorized_keys). Even if that key is stolen it can do nothing except
+# shut down, restart, answer a ping or report loaded Ollama models.
+#
+# authorized_keys line (on the server):
+#   command="/usr/local/bin/pc-remote",restrict ssh-ed25519 AAAA... laptop-control
+#
+# Install: sudo install -m 755 pc-remote /usr/local/bin/pc-remote
+
+OLLAMA_URL="${OLLAMA_URL:-http://127.0.0.1:11434}"
+
+case "${SSH_ORIGINAL_COMMAND:-}" in
+  poweroff)  exec sudo -n /usr/bin/systemctl poweroff ;;
+  reboot)    exec sudo -n /usr/bin/systemctl reboot ;;
+  ollama-ps) exec curl -s --max-time 3 "$OLLAMA_URL/api/ps" ;;
+  ping)      echo pong ;;
+  *)
+    echo "pc-remote: command not allowed: ${SSH_ORIGINAL_COMMAND:-<empty>}" >&2
+    exit 1
+    ;;
+esac
