@@ -24,6 +24,7 @@ over [Tailscale](https://tailscale.com); no ports are opened to the internet.
 | `dev [name]` | laptop | Attaches to a persistent tmux session on the server via mosh, waking it first |
 | `camera on [min]` / `off` / `status` | laptop | Streams the webcam (+ mic) as password-protected RTSP, auto-off after a timeout |
 | Phone widgets | phone | One-tap buttons that call the laptop; every tap asks for the laptop's password |
+| `homelab setup` / `doctor` | laptop | Guided setup of everything, and a health check with clear fixes |
 
 ## Security model
 
@@ -45,29 +46,43 @@ Details: [docs/security.md](docs/security.md)
 
 - Two Linux machines with systemd (tested on Arch / CachyOS) and Tailscale on both
 - Server: wired Ethernet with Wake-on-LAN enabled in BIOS, `sshd`, `tmux`, `mosh`
-- Laptop: `wakeonlan`, `mosh`, `python3`, `flock` (util-linux); for the camera also `ffmpeg` and `mediamtx`
+- Laptop: `python3`, `wakeonlan`, `mosh`, `flock` (util-linux); for the camera also `ffmpeg`,
+  `v4l-utils` and `mediamtx`. The wizard offers to install what is missing.
+  Optional: [`gum`](https://github.com/charmbracelet/gum) for a nicer wizard, `qrencode` for the phone QR code
 - Phone (optional): Android with [Termux](https://f-droid.org/packages/com.termux/) and
   [Termux:Widget](https://f-droid.org/packages/com.termux.widget/) from F-Droid, plus Tailscale
 
 ## Quick start
 
+Everything is set up from the laptop. Make sure Tailscale is connected on the laptop
+and the server, and that you can log in to the server with your password once.
+
 ```bash
 git clone https://github.com/<you>/homelab-remote.git
 cd homelab-remote
-
-# On the server
-./install.sh server
-
-# On the laptop
-./install.sh laptop
-$EDITOR ~/.config/homelab-remote/config
+./bin/homelab setup
 ```
 
-Then follow the guides in order:
+The wizard:
 
-1. [Server setup](docs/setup-server.md)
-2. [Laptop setup](docs/setup-laptop.md)
-3. [Phone setup](docs/setup-phone.md)
+- installs the commands into `~/.local/bin`
+- lets you pick the server from your tailnet and detects its MAC address, network and project folder
+- creates the SSH keys and authorizes them on the server (the control key is restricted)
+- sets the server up over SSH: `pc-remote`, a narrow sudoers rule, tmux / mosh,
+  Wake-on-LAN, no-sleep and a Tailscale-only firewall
+- detects your webcam format and opens the camera port on Tailscale only
+- prints one line (and a QR code) to paste into Termux, which links the phone and creates the widgets
+- reuses everything that already exists, and asks before every change
+
+Check everything at any time:
+
+```bash
+homelab doctor
+```
+
+Prefer doing it by hand? See the manual guides:
+[server](docs/setup-server.md), [laptop](docs/setup-laptop.md), [phone](docs/setup-phone.md).
+For a non-interactive install use `./install.sh laptop` and `./install.sh server`.
 
 ## Extras
 
@@ -80,6 +95,7 @@ Then follow the guides in order:
 - [x] Persistent remote dev sessions (tmux + mosh)
 - [x] Password-protected webcam stream with auto-off
 - [x] Phone widgets with a password gate
+- [x] Setup wizard (`homelab setup`) and health check (`homelab doctor`)
 - [ ] **Remote AI** - use the server's GPU and local / free models from the laptop and phone *(coming soon)*
 - [ ] AUR package *(planned)*
 

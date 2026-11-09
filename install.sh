@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# install.sh - install homelab-remote on the laptop or on the home server.
+# install.sh - manual, non-interactive install. Most people should run the
+# wizard instead:  ./bin/homelab setup
 #
-#   ./install.sh laptop    install pc, dev, camera, pc-phone into ~/.local/bin
+#   ./install.sh laptop    install the commands into ~/.local/bin
 #   ./install.sh server    install pc-remote and a narrow sudoers rule (needs sudo)
 #
 # Override the laptop install location with PREFIX, e.g. PREFIX=/usr/local ./install.sh laptop
@@ -26,10 +27,19 @@ install_laptop() {
   local bin="${PREFIX:-$HOME/.local}/bin"
   mkdir -p "$bin"
   local f
-  for f in pc dev camera pc-phone; do
+  for f in pc dev camera pc-phone homelab; do
     install -m 755 "$REPO_DIR/bin/$f" "$bin/$f"
     echo "Installed $bin/$f"
   done
+
+  # Data files used by "homelab setup" / "homelab doctor" after install
+  local share="${XDG_DATA_HOME:-$HOME/.local/share}/homelab-remote"
+  mkdir -p "$share/bin"
+  rm -rf "${share:?}/server" "${share:?}/extras"
+  cp -r "$REPO_DIR/server" "$REPO_DIR/extras" "$share/"
+  cp "$REPO_DIR"/bin/* "$share/bin/"
+  install -m 644 "$REPO_DIR/config.example" "$share/config.example"
+  echo "Installed data files to $share"
 
   mkdir -p "$CONFIG_DIR"
   chmod 700 "$CONFIG_DIR"
@@ -52,7 +62,7 @@ install_laptop() {
     *) echo "Warning: $bin is not in your PATH." ;;
   esac
   echo
-  echo "Next: see docs/setup-laptop.md"
+  echo "Next: run 'homelab setup' (or see docs/setup-laptop.md)"
 }
 
 install_server() {

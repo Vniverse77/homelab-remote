@@ -38,6 +38,28 @@ load_config() {
   COUNTDOWN="${COUNTDOWN:-10}"
   OLLAMA_CHECK="${OLLAMA_CHECK:-yes}"
   LOCK="${XDG_RUNTIME_DIR:-/tmp}/homelab-pc.lock"
+
+  if is_local_ip "$SERVER_IP"; then
+    echo "Error: SERVER_IP ($SERVER_IP) belongs to THIS machine, not the home server." >&2
+    echo "Refusing to continue. Fix it with 'homelab setup'." >&2
+    exit 78
+  fi
+}
+
+is_local_ip() {
+  { tailscale ip 2>/dev/null; hostname -I 2>/dev/null | tr ' ' '\n'; } | grep -xF "$1" >/dev/null
+}
+
+# Second safety net: the server's machine-id must differ from ours.
+# Older pc-remote versions do not answer; then this check is skipped.
+assert_not_self() {
+  local theirs ours
+  theirs="$(remote machine-id 2>/dev/null)"
+  ours="$(cat /etc/machine-id 2>/dev/null)"
+  if [[ -n $theirs && -n $ours && $theirs == "$ours" ]]; then
+    echo "Error: the configured server is THIS machine. Refusing to $1 it." >&2
+    exit 78
+  fi
 }
 
 remote() {
@@ -128,6 +150,7 @@ cmd_on() {
 
 cmd_off() {
   if ! is_up; then echo "Server is already off."; return 0; fi
+  assert_not_self "shut down"
   confirm "shut down"
   echo "Sending shutdown command..."
   remote poweroff || true   # connection drop is expected
@@ -142,6 +165,7 @@ cmd_off() {
 
 cmd_restart() {
   if ! is_up; then echo "Server is off and cannot be restarted. Use 'pc on'."; return 1; fi
+  assert_not_self "restart"
   confirm "restart"
   echo "Sending restart command..."
   remote reboot || true

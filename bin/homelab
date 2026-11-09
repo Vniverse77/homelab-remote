@@ -1,0 +1,883 @@
+#!/usr/bin/env bash
+# homelab - setup wizard and health check for homelab-remote.
+#
+#   homelab setup     guided setup of the laptop, server, camera and phone
+#   homelab doctor    check that everything works and explain what is wrong
+#   homelab version   print the version
+#
+# The wizard runs on the laptop only. It sets the server up over SSH, shows
+# what it is about to do before every step and asks for confirmation.
+set -uo pipefail
+
+VERSION="0.2.0"
+CONFIG="${HOMELAB_CONFIG:-$HOME/.config/homelab-remote/config}"
+SELF="$(readlink -f "$0")"
+BIN_DIR="$(dirname "$SELF")"
+INSTALL_BIN="${PREFIX:-$HOME/.local}/bin"
+INSTALL_SHARE="${XDG_DATA_HOME:-$HOME/.local/share}/homelab-remote"
+REMOTE_DIR=".cache/homelab-remote"
+CTL_PATH="${XDG_RUNTIME_DIR:-/tmp}/homelab-ssh-%C"
+
+# ---------------------------------------------------------------- UI ----
+
+HAS_GUM=0
+command -v gum >/dev/null && [[ -t 0 ]] && HAS_GUM=1
+
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+  B=$'\e[1m' D=$'\e[2m' R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' C=$'\e[36m' N=$'\e[0m'
+else
+  B="" D="" R="" G="" Y="" C="" N=""
+fi
+
+title() {
+  if (( HAS_GUM )); then
+    gum style --border rounded --border-foreground 6 --padding "0 2" --margin "1 0 0 0" --bold "$@"
+  else
+    printf '\n%s%s== %s ==%s\n' "$B" "$C" "$*" "$N"
+  fi
+}
+info()   { printf '  %s\n' "$*"; }
+dim()    { printf '  %s%s%s\n' "$D" "$*" "$N"; }
+ok()     { printf '  %s[ OK ]%s %s\n' "$G" "$N" "$*"; }
+warn()   { printf '  %s[WARN]%s %s\n' "$Y" "$N" "$*"; }
+fail()   { printf '  %s[FAIL]%s %s\n' "$R" "$N" "$*"; }
+skip()   { printf '  %s[SKIP]%s %s\n' "$D" "$N" "$*"; }
+bullet() { printf '    - %s\n' "$*"; }
+
+# confirm "question" [yes|no]  (default answer)
+confirm() {
+  local q=$1 def=${2:-yes} a
+  if (( HAS_GUM )); then
+    if [[ $def == yes ]]; then gum confirm "$q"; else gum confirm --default=false "$q"; fi
+    return
+  fi
+  local hint="[Y/n]"
+  [[ $def == no ]] && hint="[y/N]"
+  read -r -p "  $q $hint " a </dev/tty || return 1
+  a="${a,,}"
+  [[ -z $a ]] && { [[ $def == yes ]]; return; }
+  [[ $a == y || $a == yes ]]
+}
+
+# ask "prompt" "default"  -> answer on stdout
+ask() {
+  local prompt=$1 def=${2:-} a
+  if (( HAS_GUM )); then
+    gum input --prompt "$prompt: " --value "$def" --width 70
+    return
+  fi
+  read -r -p "  $prompt [$def]: " a </dev/tty || true
+  printf '%s\n' "${a:-$def}"
+}
+
+# choose "header" item...  -> chosen item on stdout
+choose() {
+  local header=$1; shift
+  if (( HAS_GUM )); then
+    gum choose --header "$header" "$@"
+    return
+  fi
+  local i=1 item a
+  printf '  %s\n' "$header" >&2
+  for item in "$@"; do printf '    %d) %s\n' "$i" "$item" >&2; i=$((i + 1)); done
+  while true; do
+    read -r -p "  Choose 1-$#: " a </dev/tty || return 1
+    if [[ $a =~ ^[0-9]+$ ]] && (( a >= 1 && a <= $# )); then
+      printf '%s\n' "${!a}"
+      return 0
+    fi
+  done
+}
+
+# choose_many "header" item...  -> chosen items, one per line (all preselected)
+choose_many() {
+  local header=$1; shift
+  if (( HAS_GUM )); then
+    local all
+    all="$(IFS=,; echo "$*")"
+    gum choose --no-limit --header "$header" --selected="$all" "$@"
+    return
+  fi
+  printf '  %s\n' "$header" >&2
+  local item
+  for item in "$@"; do
+    confirm "Include $item?" yes && printf '%s\n' "$item"
+  done
+}
+
+# plan "title" bullet... ; then asks to apply
+plan() {
+  local t=$1; shift
+  printf '\n  %s%s%s\n' "$B" "$t" "$N"
+  local b
+  for b in "$@"; do bullet "$b"; done
+  confirm "Apply?" yes
+}
+
+die() { fail "$*"; exit 1; }
+
+# ------------------------------------------------------------ helpers ----
+
+find_share() {
+  local d
+  for d in "$BIN_DIR/.." "$INSTALL_SHARE" /usr/share/homelab-remote; do
+    if [[ -f $d/server/pc-remote && -f $d/config.example ]]; then
+      readlink -f "$d"
+      return 0
+    fi
+  done
+  return 1
+}
+
+has() { command -v "$1" >/dev/null; }
+
+is_local_ip() {
+  { tailscale ip 2>/dev/null; hostname -I 2>/dev/null | tr ' ' '\n'; } | grep -xF "$1" >/dev/null
+}
+
+pkg_install() {
+  if has pacman; then
+    sudo pacman -S --needed --noconfirm "$@"
+  elif has apt-get; then
+    sudo apt-get install -y "$@"
+  else
+    warn "Unknown package manager. Please install: $*"
+    return 1
+  fi
+}
+
+aur_install() {
+  local helper
+  for helper in paru yay; do
+    if has "$helper"; then "$helper" -S --needed "$@"; return; fi
+  done
+  warn "No AUR helper (paru or yay) found. Please install manually: $*"
+  return 1
+}
+
+# Offer to install missing packages: offer_packages "why" cmd:pkg ...
+offer_packages() {
+  local why=$1; shift
+  local missing=() pair
+  for pair in "$@"; do
+    has "${pair%%:*}" || missing+=("${pair#*:}")
+  done
+  (( ${#missing[@]} )) || return 0
+  if plan "Install missing packages ($why)" "${missing[@]}"; then
+    pkg_install "${missing[@]}"
+  else
+    warn "Skipped. Some features will not work without: ${missing[*]}"
+  fi
+}
+
+load_config() {
+  if [[ -r $CONFIG ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG"
+  fi
+}
+
+# set_conf KEY VALUE  - replace the value of KEY in the config, keep comments
+set_conf() {
+  python3 - "$CONFIG" "$1" "$2" <<'EOF'
+import re, sys
+path, key, value = sys.argv[1:4]
+home = __import__("os").path.expanduser("~")
+if value.startswith(home + "/"):
+    value = "$HOME" + value[len(home):]
+with open(path) as f:
+    lines = f.read().split("\n")
+pat = re.compile(r'^' + re.escape(key) + r'=("[^"]*"|\S*)')
+done = False
+for i, line in enumerate(lines):
+    if pat.match(line):
+        lines[i] = pat.sub(lambda m: key + '="' + value + '"', line, count=1)
+        done = True
+        break
+if not done:
+    lines.insert(len(lines) - 1 if lines and lines[-1] == "" else len(lines), f'{key}="{value}"')
+with open(path, "w") as f:
+    f.write("\n".join(lines))
+EOF
+}
+
+lan_broadcast() {
+  local iface
+  iface="$(ip -4 route show default table main 2>/dev/null \
+    | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')"
+  [[ -n $iface ]] || return 0
+  ip -4 -o addr show dev "$iface" 2>/dev/null \
+    | awk '{for (i = 1; i < NF; i++) if ($i == "brd") { print $(i + 1); exit }}'
+}
+
+# Lists tailnet peers as "name  ip  os  state"
+tailnet_peers() {
+  tailscale status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    peers = json.load(sys.stdin).get("Peer", {}).values()
+except Exception:
+    sys.exit(0)
+rows = []
+for p in peers:
+    ips = [ip for ip in p.get("TailscaleIPs", []) if "." in ip]
+    if not ips:
+        continue
+    name = p.get("HostName") or p.get("DNSName", "?").split(".")[0]
+    state = "online" if p.get("Online") else "offline"
+    rows.append((p.get("OS") != "linux", state != "online", name, ips[0], p.get("OS", "?"), state))
+for r in sorted(rows):
+    print(f"{r[2]:<16} {r[3]:<16} {r[4]:<8} {r[5]}")
+'
+}
+
+ssh_base() {
+  printf '%s\n' -o ControlMaster=auto -o "ControlPath=$CTL_PATH" -o ControlPersist=300 \
+    -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
+    -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no
+}
+
+# srv CMD...  - run on the server with the dev key (multiplexed, one passphrase prompt)
+srv() {
+  local opts
+  mapfile -t opts < <(ssh_base)
+  ssh -i "$DEV_KEY" "${opts[@]}" "$SERVER_USER@$SERVER_IP" "$@"
+}
+
+# srv_tty CMD... - same, with a terminal (needed for sudo password prompts)
+srv_tty() {
+  local opts
+  mapfile -t opts < <(ssh_base)
+  ssh -t -i "$DEV_KEY" "${opts[@]}" "$SERVER_USER@$SERVER_IP" "$@"
+}
+
+srv_close() {
+  [[ -n ${SERVER_IP:-} ]] || return 0
+  local opts
+  mapfile -t opts < <(ssh_base)
+  ssh "${opts[@]}" -O exit "$SERVER_USER@$SERVER_IP" 2>/dev/null || true
+}
+
+upload_helper() {
+  local opts
+  mapfile -t opts < <(ssh_base)
+  srv "mkdir -p $REMOTE_DIR" &&
+    scp -q -i "$DEV_KEY" "${opts[@]}" "$SHARE/server/server-setup" "$SHARE/server/pc-remote" \
+      "$SERVER_USER@$SERVER_IP:$REMOTE_DIR/" &&
+    srv "chmod +x $REMOTE_DIR/server-setup $REMOTE_DIR/pc-remote"
+}
+
+# Reads "key=value" lines from the server into SRV_<key> variables
+server_check() {
+  local line k v
+  while IFS= read -r line; do
+    [[ $line == *=* ]] || continue
+    k="${line%%=*}"; v="${line#*=}"
+    [[ $k =~ ^[a-z_]+$ ]] || continue
+    printf -v "SRV_$k" '%s' "$v"
+  done < <(srv "$REMOTE_DIR/server-setup check" 2>/dev/null)
+  [[ -n ${SRV_user:-} ]]
+}
+
+local_ufw_allow() {
+  # local_ufw_allow PORT PROTO
+  has ufw || { skip "ufw is not installed on this laptop."; return 0; }
+  sudo ufw allow in on tailscale0 to any port "$1" proto "$2" >/dev/null && \
+    ok "Firewall: port $1/$2 open on Tailscale only"
+}
+
+# ------------------------------------------------------------- steps ----
+
+step_preflight() {
+  title "homelab-remote setup $VERSION"
+  info "This wizard sets up your laptop, home server, camera and phone."
+  info "It shows what it will do before every step and asks first."
+  dim  "Run 'homelab doctor' at any time to check everything."
+  echo
+
+  if (( ! HAS_GUM )) && has pacman && [[ -t 0 ]]; then
+    if confirm "Install 'gum' for a nicer wizard? (optional)" no; then
+      pkg_install gum && HAS_GUM=1
+    fi
+  fi
+
+  has python3 || die "python3 is required."
+  has tailscale || die "Tailscale is required. Install it, run 'sudo tailscale up', then start again."
+  if [[ -z $(tailscale ip -4 2>/dev/null) ]]; then
+    die "Tailscale is not connected. Run 'sudo tailscale up' and start again."
+  fi
+  ok "Tailscale is connected ($(tailscale ip -4 | head -n 1))"
+}
+
+choose_parts() {
+  echo
+  dim "Remote AI (use the server's GPU and models from anywhere) - coming soon"
+  mapfile -t PARTS < <(choose_many "What do you want to set up? (space to toggle, enter to confirm)" \
+    Laptop Server Camera Phone)
+  (( ${#PARTS[@]} )) || die "Nothing selected."
+}
+
+wants() {
+  local p
+  for p in "${PARTS[@]}"; do [[ $p == "$1" ]] && return 0; done
+  return 1
+}
+
+step_install_files() {
+  title "1. Laptop: install commands"
+  local targets=() f
+  for f in pc dev camera pc-phone homelab; do targets+=("$INSTALL_BIN/$f"); done
+
+  if [[ $SHARE == "$INSTALL_SHARE" && $BIN_DIR == "$INSTALL_BIN" ]]; then
+    ok "Commands are already installed in $INSTALL_BIN"
+  elif plan "Copy commands and data files" \
+      "pc, dev, camera, pc-phone, homelab -> $INSTALL_BIN" \
+      "server helpers and extras -> $INSTALL_SHARE"; then
+    mkdir -p "$INSTALL_BIN" "$INSTALL_SHARE"
+    for f in pc dev camera pc-phone homelab; do
+      install -m 755 "$SHARE/bin/$f" "$INSTALL_BIN/$f"
+    done
+    if [[ $SHARE != "$INSTALL_SHARE" ]]; then
+      rm -rf "${INSTALL_SHARE:?}/server" "${INSTALL_SHARE:?}/extras"
+      cp -r "$SHARE/server" "$SHARE/extras" "$INSTALL_SHARE/"
+      install -m 644 "$SHARE/config.example" "$INSTALL_SHARE/config.example"
+      [[ -d $SHARE/bin ]] && { mkdir -p "$INSTALL_SHARE/bin"; cp "$SHARE"/bin/* "$INSTALL_SHARE/bin/"; }
+    fi
+    ok "Installed commands to $INSTALL_BIN"
+  fi
+
+  case ":$PATH:" in
+    *":$INSTALL_BIN:"*) ;;
+    *)
+      warn "$INSTALL_BIN is not in your PATH."
+      if has fish; then dim "fish: fish_add_path $INSTALL_BIN"; fi
+      dim "bash: echo 'export PATH=\"$INSTALL_BIN:\$PATH\"' >> ~/.bashrc"
+      ;;
+  esac
+
+  offer_packages "laptop tools" wakeonlan:wakeonlan mosh:mosh ssh:openssh flock:util-linux
+
+  if has fish && [[ -f $SHARE/extras/fish/host-badge.fish ]]; then
+    local fishconf="$HOME/.config/fish/config.fish"
+    if grep -qs 'host-badge.fish' "$fishconf"; then
+      ok "fish host badge is enabled"
+    elif plan "Show the machine name in your fish prompt" \
+        "copy host-badge.fish to ~/.config/fish/" \
+        "add one 'source' line at the end of config.fish"; then
+      mkdir -p "$HOME/.config/fish"
+      install -m 644 "$SHARE/extras/fish/host-badge.fish" "$HOME/.config/fish/host-badge.fish"
+      printf '\nsource ~/.config/fish/host-badge.fish\n' >> "$fishconf"
+      ok "fish host badge enabled (open a new terminal)"
+    fi
+  fi
+}
+
+step_config() {
+  title "2. Laptop: connection to your server"
+  mkdir -p "$(dirname "$CONFIG")"
+  chmod 700 "$(dirname "$CONFIG")"
+  if [[ -e $CONFIG ]]; then
+    ok "Found existing config: $CONFIG (values below are pre-filled from it)"
+  else
+    install -m 600 "$SHARE/config.example" "$CONFIG"
+    ok "Created $CONFIG"
+  fi
+  load_config
+
+  # Server
+  local peers=() line choice
+  mapfile -t peers < <(tailnet_peers)
+  if (( ${#peers[@]} )); then
+    local current=""
+    for line in "${peers[@]}"; do
+      [[ -n ${SERVER_IP:-} && $line == *" $SERVER_IP "* ]] && current="$line"
+    done
+    [[ -n $current ]] && info "Current server: $current"
+    choice="$(choose "Which machine is your home server?" "${peers[@]}" "Enter an IP manually")"
+    if [[ $choice == "Enter an IP manually" ]]; then
+      SERVER_IP="$(ask "Server Tailscale IP" "${SERVER_IP:-}")"
+    else
+      SERVER_IP="$(awk '{print $2}' <<<"$choice")"
+    fi
+  else
+    warn "No other devices found in your tailnet."
+    SERVER_IP="$(ask "Server Tailscale IP" "${SERVER_IP:-}")"
+  fi
+  [[ $SERVER_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Not a valid IPv4 address: $SERVER_IP"
+  if is_local_ip "$SERVER_IP"; then
+    die "$SERVER_IP is THIS laptop. Run the wizard on the laptop and pick your home PC as the server."
+  fi
+
+  SERVER_USER="$(ask "Your user name on the server" "${SERVER_USER:-${USER:-}}")"
+  [[ -n $SERVER_USER ]] || die "A user name is required."
+
+  local brd
+  brd="$(lan_broadcast)"
+  LAN_BROADCAST="$(ask "Home LAN broadcast address (detected)" "${LAN_BROADCAST:-$brd}")"
+
+  # Keys: reuse what the config points to if it exists
+  CONTROL_KEY="${CONTROL_KEY:-$HOME/.ssh/homelab_control}"
+  DEV_KEY="${DEV_KEY:-$HOME/.ssh/homelab_dev}"
+  [[ -e $CONTROL_KEY ]] || CONTROL_KEY="$HOME/.ssh/homelab_control"
+  [[ -e $DEV_KEY ]] || DEV_KEY="$HOME/.ssh/homelab_dev"
+
+  set_conf SERVER_IP "$SERVER_IP"
+  set_conf SERVER_USER "$SERVER_USER"
+  set_conf LAN_BROADCAST "$LAN_BROADCAST"
+  set_conf CONTROL_KEY "$CONTROL_KEY"
+  set_conf DEV_KEY "$DEV_KEY"
+  ok "Saved server $SERVER_USER@$SERVER_IP"
+}
+
+step_keys() {
+  title "3. Laptop: SSH keys"
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh"
+
+  if [[ -e $CONTROL_KEY ]]; then
+    ok "Control key exists: $CONTROL_KEY"
+  elif plan "Create the control key (restricted on the server, no passphrase)" "$CONTROL_KEY"; then
+    ssh-keygen -q -t ed25519 -f "$CONTROL_KEY" -N "" -C "homelab-control@$(hostname)"
+    ok "Created $CONTROL_KEY"
+  fi
+
+  if [[ -e $DEV_KEY ]]; then
+    ok "Dev key exists: $DEV_KEY"
+  elif plan "Create the dev key (full shell on the server)" \
+      "$DEV_KEY" "you will be asked for a passphrase - please set one"; then
+    ssh-keygen -t ed25519 -f "$DEV_KEY" -C "homelab-dev@$(hostname)"
+    ok "Created $DEV_KEY"
+  fi
+  [[ -e $DEV_KEY && -e $CONTROL_KEY ]] || die "Both keys are needed to continue."
+
+  # Dev key on the server
+  info "Connecting to the server with the dev key (you may be asked for its passphrase)..."
+  if srv true 2>/dev/null; then
+    ok "Dev key works on the server"
+  else
+    if plan "Authorize the dev key on the server" \
+        "ssh-copy-id will ask for your SERVER password once"; then
+      ssh-copy-id -i "$DEV_KEY.pub" "$SERVER_USER@$SERVER_IP" || die "Could not copy the key."
+      srv true || die "The dev key still does not work."
+      ok "Dev key works on the server"
+    else
+      die "The wizard needs the dev key on the server to continue."
+    fi
+  fi
+
+  # Control key with forced command
+  local pub
+  pub="$(awk '{print $2}' "$CONTROL_KEY.pub")"
+  local line
+  line="$(srv "grep -F '$pub' ~/.ssh/authorized_keys 2>/dev/null" || true)"
+  if [[ $line == *'command="/usr/local/bin/pc-remote"'* ]]; then
+    ok "Control key is authorized and restricted"
+  elif [[ -n $line ]]; then
+    warn "The control key is authorized WITHOUT restrictions on the server."
+    dim  "Edit ~/.ssh/authorized_keys on the server and prefix its line with:"
+    dim  "command=\"/usr/local/bin/pc-remote\",restrict"
+  elif plan "Authorize the control key on the server" \
+      "it may only run /usr/local/bin/pc-remote (power control)"; then
+    printf 'command="/usr/local/bin/pc-remote",restrict %s\n' "$(cat "$CONTROL_KEY.pub")" \
+      | srv 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'
+    ok "Control key authorized (restricted)"
+  fi
+}
+
+step_server() {
+  title "4. Server: power control and remote sessions"
+  upload_helper || die "Could not upload the helper to the server."
+  server_check || die "Could not read the server status."
+  if [[ -n ${SRV_machine_id:-} && $SRV_machine_id == "$(cat /etc/machine-id 2>/dev/null)" ]]; then
+    die "The server you picked is THIS laptop. Run 'homelab setup' again and pick your home PC."
+  fi
+
+  info "Server: ${SRV_user}@${SERVER_IP}  wired card: ${SRV_iface:-none}  MAC: ${SRV_mac:-?}"
+
+  if [[ ${SRV_wired:-no} != yes ]]; then
+    warn "No wired network card found on the server. Wake-on-LAN needs Ethernet,"
+    warn "so 'pc on' will not work. Everything else will."
+  elif [[ ${SRV_carrier:-no} != yes ]]; then
+    warn "No cable is plugged into ${SRV_iface}. Plug it in, or 'pc on' cannot wake the server."
+  fi
+  if [[ ${SRV_route_wireless:-no} == yes && ${SRV_wired:-no} == yes ]]; then
+    dim "The server uses Wi-Fi (${SRV_route_iface:-?}) for internet. That is fine, but keep the"
+    dim "Ethernet cable in ${SRV_iface} plugged in: only the wired card can wake the PC."
+  fi
+  if [[ -n ${SRV_mac:-} ]]; then
+    load_config
+    if [[ ${SERVER_MAC:-} != "$SRV_mac" ]]; then
+      SERVER_MAC="$(ask "Wired card MAC for Wake-on-LAN (detected on ${SRV_iface})" "$SRV_mac")"
+      set_conf SERVER_MAC "$SERVER_MAC"
+    fi
+    ok "MAC address: $SERVER_MAC"
+  else
+    SERVER_MAC="$(ask "Server MAC for Wake-on-LAN" "${SERVER_MAC:-}")"
+    set_conf SERVER_MAC "$SERVER_MAC"
+  fi
+
+  if [[ -n ${SRV_projects:-} || -n ${PROJECTS_DIR:-} ]]; then
+    PROJECTS_DIR="$(ask "Project folder on the server" "${PROJECTS_DIR:-$SRV_projects}")"
+  else
+    PROJECTS_DIR="$(ask "Project folder on the server" "${SRV_home:-/home/$SERVER_USER}/Projects")"
+  fi
+  set_conf PROJECTS_DIR "$PROJECTS_DIR"
+  srv "mkdir -p '$PROJECTS_DIR'" 2>/dev/null || true
+
+  # Collect root steps, then run them with one sudo prompt
+  local steps=() lines=()
+  [[ ${SRV_pc_remote:-missing} != current ]] && { steps+=(pc-remote); lines+=("install /usr/local/bin/pc-remote (${SRV_pc_remote:-missing})"); }
+  [[ ${SRV_sudoers:-no} != yes ]] && { steps+=(sudoers); lines+=("allow '$SRV_user' to run only 'systemctl poweroff/reboot' without a password"); }
+  if [[ ${SRV_tmux:-no} != yes || ${SRV_mosh:-no} != yes ]]; then
+    steps+=(packages); lines+=("install tmux, mosh and ethtool")
+  fi
+  [[ ${SRV_wol:-unknown} != g ]] && { steps+=(wol); lines+=("enable Wake-on-LAN on ${SRV_iface:-the wired network card}"); }
+
+  if [[ ${SRV_sleep_masked:-no} != yes ]]; then
+    info "When you are away, nothing at home can wake the server, so it should never sleep."
+    if confirm "Disable sleep and suspend on the server?" yes; then
+      steps+=(nosleep); lines+=("disable sleep / suspend / hibernate")
+    fi
+  fi
+
+  if [[ ${SRV_ufw:-absent} != absent ]]; then
+    steps+=(firewall)
+    lines+=("firewall: allow SSH and mosh on Tailscale only, deny other incoming")
+    lines+=("you will be asked before any rule that exposes SSH / remote desktop is removed")
+  else
+    warn "ufw is not installed on the server. Consider installing it."
+  fi
+
+  if (( ${#steps[@]} )); then
+    if plan "Apply on the server (asks for your server sudo password once)" "${lines[@]}"; then
+      if srv_tty "sudo $REMOTE_DIR/server-setup apply --user '$SRV_user' ${steps[*]}"; then
+        ok "Server steps applied"
+      else
+        warn "Some server steps failed, see the output above."
+      fi
+    fi
+  else
+    ok "Server system setup is already complete"
+  fi
+
+  if [[ ${SRV_tmux_conf:-no} != yes ]] && confirm "Write a phone-friendly ~/.tmux.conf on the server?" yes; then
+    if srv "$REMOTE_DIR/server-setup user-apply tmux"; then ok "tmux config written"; fi
+  fi
+
+  echo
+  info "Two BIOS settings on the server cannot be changed from here:"
+  bullet "Wake on LAN (or 'Power On by PCI-E'): Enabled; ErP / Deep Sleep: Disabled"
+  bullet "Restore on AC Power Loss: Power On (comes back after a power cut)"
+}
+
+pick_camera_format() {
+  # Prints "FORMAT SIZE" for the best MJPEG <= 1280x720, else YUYV 640x480
+  v4l2-ctl -d "$1" --list-formats-ext 2>/dev/null | python3 -c '
+import re, sys
+fmt, best = None, {}
+for line in sys.stdin:
+    m = re.search(r"\[\d+\]: .(\w+).", line)
+    if m:
+        fmt = m.group(1); continue
+    m = re.search(r"Size: Discrete (\d+)x(\d+)", line)
+    if m and fmt:
+        w, h = int(m.group(1)), int(m.group(2))
+        if w <= 1280 and h <= 720:
+            best[fmt] = max(best.get(fmt, (0, 0)), (w, h))
+for fmt, ff in (("MJPG", "mjpeg"), ("YUYV", "yuyv422")):
+    if fmt in best:
+        w, h = best[fmt]
+        if fmt == "YUYV":
+            w, h = min(best[fmt], (640, 480))
+        print(ff, f"{w}x{h}")
+        break
+'
+}
+
+step_camera() {
+  title "5. Laptop: camera stream"
+  offer_packages "camera" ffmpeg:ffmpeg v4l2-ctl:v4l-utils
+  if ! has mediamtx; then
+    if plan "Install mediamtx (RTSP server) from the AUR" "mediamtx-bin"; then
+      aur_install mediamtx-bin || aur_install mediamtx || true
+    fi
+  fi
+  if ! has ffmpeg || ! has mediamtx; then
+    warn "Camera needs ffmpeg and mediamtx. Skipping."
+    return 0
+  fi
+
+  local devs=() d
+  for d in /dev/video*; do
+    [[ -e $d ]] || continue
+    v4l2-ctl -d "$d" --list-formats 2>/dev/null | grep -q '\[0\]' && devs+=("$d")
+  done
+  (( ${#devs[@]} )) || { warn "No webcam found."; return 0; }
+  load_config
+  local dev="${devs[0]}"
+  (( ${#devs[@]} > 1 )) && dev="$(choose "Which camera?" "${devs[@]}")"
+
+  local fmt size
+  read -r fmt size < <(pick_camera_format "$dev")
+  if [[ -n ${fmt:-} ]]; then
+    ok "Camera $dev: $fmt $size"
+    set_conf CAMERA_DEVICE "$dev"
+    set_conf CAMERA_INPUT_FORMAT "$fmt"
+    set_conf CAMERA_SIZE "$size"
+  else
+    warn "Could not detect formats for $dev, keeping config values."
+  fi
+
+  if confirm "Include the microphone in the stream?" yes; then
+    set_conf CAMERA_AUDIO yes
+  else
+    set_conf CAMERA_AUDIO no
+  fi
+
+  load_config
+  if plan "Open the camera port on this laptop" \
+      "allow ${CAMERA_PORT:-8554}/tcp on Tailscale only (sudo)"; then
+    local_ufw_allow "${CAMERA_PORT:-8554}" tcp
+  fi
+
+  if confirm "Run a 1-minute test stream now?" yes; then
+    "$INSTALL_BIN/camera" on 1 && dim "Open the link above in VLC. It stops by itself after 1 minute."
+  fi
+}
+
+step_phone() {
+  title "6. Phone: one-tap widgets"
+  info "Android with Termux, Termux:Widget (both from F-Droid) and Tailscale."
+  info "The phone stores no logic: each widget calls this laptop, which asks for"
+  info "this laptop's password before running anything."
+  echo
+
+  if [[ $(systemctl is-active sshd 2>/dev/null) != active ]]; then
+    if plan "Start the SSH server on this laptop" "systemctl enable --now sshd (sudo)"; then
+      sudo systemctl enable --now sshd && ok "sshd is running"
+    fi
+  else
+    ok "sshd is running"
+  fi
+  if plan "Allow SSH to this laptop over Tailscale only" "allow 22/tcp on tailscale0 (sudo)"; then
+    local_ufw_allow 22 tcp
+  fi
+
+  if grep -qs 'pc-phone' "$HOME/.ssh/authorized_keys"; then
+    ok "A phone is already linked to this laptop."
+    confirm "Link a phone again (new phone or new widgets)?" no || return 0
+  fi
+
+  local me ip gate
+  me="${USER:-$(id -un)}"
+  ip="$(tailscale ip -4 | head -n 1)"
+  gate="$INSTALL_BIN/pc-phone"
+
+  local widgets='"PC On:pc on" "PC Off:pc off" "PC Restart:pc restart" "PC Status:pc status"'
+  if has mediamtx && has ffmpeg; then
+    widgets+=' "Camera On:camera on" "Camera Off:camera off"'
+  fi
+
+  local script
+  script="$(cat <<EOF
+set -e
+pkg install -y openssh
+mkdir -p ~/.ssh ~/.shortcuts
+[ -f ~/.ssh/homelab_phone ] || ssh-keygen -q -t ed25519 -f ~/.ssh/homelab_phone -N "" -C homelab-phone
+echo "Enter the password of $me on the laptop once:"
+echo "command=\"$gate\",restrict,pty \$(cat ~/.ssh/homelab_phone.pub)" | ssh -o StrictHostKeyChecking=accept-new $me@$ip "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"
+for p in $widgets; do
+  n=\${p%%:*}; c=\${p#*:}
+  printf '#!/data/data/com.termux/files/usr/bin/bash\nssh -t -i ~/.ssh/homelab_phone $me@$ip "%s"\nsleep 3\nexit\n' "\$c" > ~/.shortcuts/"\$n"
+  chmod +x ~/.shortcuts/"\$n"
+done
+echo "Done. Add the Termux:Widget widget to your home screen."
+EOF
+)"
+  local cmd
+  cmd="echo $(printf '%s' "$script" | base64 -w0) | base64 -d | bash"
+
+  info "On the phone: connect Tailscale, open Termux and paste this ONE line:"
+  echo
+  printf '%s\n' "$cmd"
+  echo
+  if has qrencode; then
+    info "Or scan this QR code with the phone camera to copy the line:"
+    qrencode -t ansiutf8 "$cmd"
+  else
+    dim "Tip: install 'qrencode' to show this as a QR code next time."
+  fi
+  dim "Move it with KDE Connect clipboard sync or LocalSend if typing is hard."
+  if confirm "Show the script behind that line before you run it?" no; then
+    printf '%s\n' "$script" | sed 's/^/    /'
+  fi
+  info "Password logins must be allowed on this laptop's sshd for that one step."
+  confirm "Done on the phone?" yes || true
+}
+
+# ------------------------------------------------------------ doctor ----
+
+DOC_FAIL=0 DOC_WARN=0
+d_ok()   { ok "$*"; }
+d_warn() { warn "$*"; DOC_WARN=$((DOC_WARN + 1)); }
+d_fail() { fail "$*"; DOC_FAIL=$((DOC_FAIL + 1)); }
+
+cmd_doctor() {
+  SHARE="$(find_share)" || SHARE=""
+  title "homelab doctor"
+
+  echo; info "${B}Laptop${N}"
+  if [[ -r $CONFIG ]]; then d_ok "Config: $CONFIG"; else d_fail "No config. Run 'homelab setup'."; fi
+  load_config
+  local v missing=()
+  for v in SERVER_IP SERVER_USER SERVER_MAC LAN_BROADCAST CONTROL_KEY DEV_KEY PROJECTS_DIR; do
+    [[ -n ${!v:-} ]] || missing+=("$v")
+  done
+  if (( ${#missing[@]} )); then d_fail "Config values missing: ${missing[*]}"; else d_ok "Config values are set"; fi
+
+  local c
+  for c in pc dev camera pc-phone; do
+    if has "$c"; then d_ok "Command '$c' is in PATH"; else d_fail "Command '$c' not found in PATH"; fi
+  done
+  for c in ssh tailscale wakeonlan mosh python3 flock; do
+    has "$c" || d_warn "Tool '$c' is not installed"
+  done
+
+  if [[ -n $(tailscale ip -4 2>/dev/null) ]]; then d_ok "Tailscale is connected"; else d_fail "Tailscale is not connected"; fi
+
+  local brd
+  brd="$(lan_broadcast)"
+  if [[ -n ${LAN_BROADCAST:-} && $brd == "$LAN_BROADCAST" ]]; then
+    d_ok "On the home LAN ($brd): 'pc on' can wake the server"
+  else
+    d_warn "Not on the home LAN (now: ${brd:-none}): 'pc on' only works at home"
+  fi
+
+  for v in CONTROL_KEY DEV_KEY; do
+    if [[ -n ${!v:-} && -r ${!v} ]]; then d_ok "$v exists"; else d_fail "$v missing (${!v:-unset})"; fi
+  done
+
+  echo; info "${B}Server${N}"
+  local server_up=0
+  if [[ -n ${SERVER_IP:-} ]] && is_local_ip "$SERVER_IP"; then
+    d_fail "SERVER_IP ($SERVER_IP) is THIS machine. 'pc off' would shut down this laptop. Run 'homelab setup'."
+    SERVER_IP=""
+  fi
+  if [[ -n ${SERVER_IP:-} && -r ${CONTROL_KEY:-/nonexistent} ]]; then
+    local pong
+    pong="$(ssh -i "$CONTROL_KEY" -o BatchMode=yes -o ConnectTimeout=5 \
+      "$SERVER_USER@$SERVER_IP" ping 2>/dev/null || true)"
+    if [[ $pong == pong ]]; then
+      d_ok "Control key reaches pc-remote on the server"; server_up=1
+    elif tailscale ping -c 2 --timeout=3s "$SERVER_IP" &>/dev/null; then
+      d_fail "Server is up but the control key / pc-remote does not answer"
+      server_up=1
+    else
+      d_warn "Server is off or unreachable (start it with 'pc on')"
+    fi
+  fi
+
+  if (( server_up )) && [[ -n $SHARE && -r ${DEV_KEY:-/nonexistent} ]]; then
+    if ssh -i "$DEV_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$SERVER_USER@$SERVER_IP" true 2>/dev/null; then
+      d_ok "Dev key works (dev sessions)"
+      if upload_helper 2>/dev/null && server_check; then
+        if [[ -n ${SRV_machine_id:-} && $SRV_machine_id == "$(cat /etc/machine-id 2>/dev/null)" ]]; then
+          d_fail "The configured server is THIS machine. Run 'homelab setup' and pick your home PC."
+        fi
+        if [[ ${SRV_pc_remote:-} == current ]]; then d_ok "pc-remote is installed"
+        else d_fail "pc-remote is ${SRV_pc_remote:-missing} on the server"; fi
+        if [[ ${SRV_sudoers:-} == yes ]]; then d_ok "Shutdown/restart allowed without password"
+        else d_fail "sudoers rule missing on the server"; fi
+        if [[ ${SRV_tmux:-} == yes && ${SRV_mosh:-} == yes ]]; then d_ok "tmux and mosh are installed"
+        else d_warn "tmux or mosh missing on the server"; fi
+        if [[ ${SRV_sleep_masked:-} == yes ]]; then d_ok "Server never sleeps"
+        else d_warn "Server may go to sleep (nothing can wake it while you are away)"; fi
+        if [[ ${SRV_wired:-no} != yes ]]; then
+          d_fail "No wired network card on the server: Wake-on-LAN cannot work"
+        elif [[ ${SRV_carrier:-no} != yes ]]; then
+          d_fail "No cable in ${SRV_iface}: 'pc on' cannot wake the server"
+        fi
+        case ${SRV_wol:-unknown} in
+          g) d_ok "Wake-on-LAN enabled on ${SRV_iface:-?}" ;;
+          unknown) d_warn "Wake-on-LAN state unknown. Check on the server: sudo ethtool ${SRV_iface:-<iface>} | grep Wake-on" ;;
+          *) d_fail "Wake-on-LAN is '${SRV_wol}' on ${SRV_iface:-?} (should be 'g')" ;;
+        esac
+        if [[ ${SRV_mac:-} != "${SERVER_MAC:-}" ]]; then
+          d_fail "Config SERVER_MAC is ${SERVER_MAC:-empty}, but the server's wired card ${SRV_iface:-?} has ${SRV_mac:-unknown}. Run 'homelab setup' to fix."
+        fi
+        if [[ ${SRV_ufw:-} == active ]]; then d_ok "Server firewall is active"
+        else d_warn "Server firewall is ${SRV_ufw:-unknown}"; fi
+      fi
+      srv_close
+    else
+      d_warn "Dev key needs its passphrase: run 'ssh-add $DEV_KEY' for full server checks"
+    fi
+  fi
+
+  echo; info "${B}Phone${N}"
+  if grep -qs 'pc-phone' "$HOME/.ssh/authorized_keys"; then
+    d_ok "A phone is linked (restricted to pc-phone)"
+    grep -s 'pc-phone' "$HOME/.ssh/authorized_keys" | grep -q 'restrict' \
+      || d_fail "Phone key is not restricted (missing 'restrict')"
+  else
+    d_warn "No phone linked ('homelab setup' > Phone)"
+  fi
+  if [[ $(systemctl is-active sshd 2>/dev/null) == active ]]; then d_ok "sshd is running"; else d_warn "sshd is not running"; fi
+
+  echo; info "${B}Camera${N}"
+  if has ffmpeg && has mediamtx; then
+    if [[ -e ${CAMERA_DEVICE:-/dev/video0} ]]; then d_ok "Camera ready (${CAMERA_DEVICE:-/dev/video0})"
+    else d_warn "Camera device ${CAMERA_DEVICE:-/dev/video0} not found"; fi
+  else
+    d_warn "Camera not set up (needs ffmpeg and mediamtx)"
+  fi
+
+  echo; info "${B}Coming soon${N}"
+  dim "Remote AI: use the server's GPU and models from the laptop and phone"
+
+  echo
+  if (( DOC_FAIL )); then
+    fail "$DOC_FAIL problem(s), $DOC_WARN warning(s). Run 'homelab setup' to fix."
+    return 1
+  elif (( DOC_WARN )); then
+    warn "No problems, $DOC_WARN warning(s)."
+  else
+    ok "Everything looks good."
+  fi
+}
+
+# ------------------------------------------------------------- setup ----
+
+cmd_setup() {
+  SHARE="$(find_share)" || die "Cannot find homelab-remote data files (server/, config.example)."
+  [[ -t 0 ]] || die "'homelab setup' is interactive; run it in a terminal."
+  trap 'srv_close' EXIT
+  trap 'echo; warn "Cancelled."; exit 130' INT
+
+  step_preflight
+  choose_parts
+
+  if wants Laptop || wants Server || wants Phone; then
+    step_install_files
+    step_config
+    if wants Server || wants Laptop; then
+      step_keys
+    fi
+  fi
+  wants Server && step_server
+  wants Camera && step_camera
+  wants Phone && step_phone
+
+  title "Final check"
+  cmd_doctor || true
+  echo
+  info "Commands: ${B}pc on|off|restart|status${N}, ${B}dev${N}, ${B}camera on|off|status${N}, ${B}homelab doctor${N}"
+}
+
+case "${1:-}" in
+  setup)   cmd_setup ;;
+  doctor)  cmd_doctor ;;
+  version|--version|-V) echo "homelab-remote $VERSION" ;;
+  -h|--help|help|"") sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

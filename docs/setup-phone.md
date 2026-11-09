@@ -1,5 +1,8 @@
 # Phone setup (Android)
 
+> The easiest way is the wizard: run `homelab setup` on the laptop. This page describes
+> the same steps done by hand.
+
 The phone holds no logic. Every widget is a one-line shortcut that connects to the
 laptop, where `pc-phone` asks for the laptop's password and runs the command.
 

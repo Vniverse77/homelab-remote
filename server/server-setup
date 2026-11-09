@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# server-setup - server-side helper for the homelab-remote wizard.
+# Uploaded and run over SSH by "homelab setup" / "homelab doctor" on the laptop.
+#
+#   server-setup check                       print status as key=value lines
+#   server-setup user-apply tmux             write a default ~/.tmux.conf (no sudo)
+#   sudo server-setup apply --user U STEP..  apply system steps (needs root)
+#
+# Steps: pc-remote sudoers packages wol nosleep firewall firewall-harden
+set -uo pipefail
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+SUDOERS_FILE="/etc/sudoers.d/homelab-remote"
+
+default_iface() {
+  ip -4 route show default table main 2>/dev/null \
+    | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}'
+}
+
+# Wake-on-LAN needs the wired card, not whatever carries the default route.
+# Prints the first physical, non-wireless interface, preferring one with a
+# cable plugged in (carrier = 1).
+wired_iface() {
+  local d n fallback=""
+  for d in /sys/class/net/*; do
+    n="${d##*/}"
+    [[ -e $d/device && ! -d $d/wireless && ! -e $d/phy80211 ]] || continue
+    if [[ $(cat "$d/carrier" 2>/dev/null) == 1 ]]; then
+      echo "$n"
+      return 0
+    fi
+    [[ -z $fallback ]] && fallback="$n"
+  done
+  [[ -n $fallback ]] && echo "$fallback"
+}
+
+nm_connection() {
+  command -v nmcli >/dev/null || return 0
+  local conn
+  conn="$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null \
+    | awk -F: -v d="$1" '$2 == d { print $1; exit }')"
+  if [[ -z $conn ]]; then
+    # Cable unplugged: fall back to any saved wired connection
+    conn="$(nmcli -t -f NAME,TYPE connection show 2>/dev/null \
+      | awk -F: '$2 == "802-3-ethernet" { print $1; exit }')"
+  fi
+  echo "$conn"
+}
+
+cmd_check() {
+  local iface route_iface mac="" wol="unknown" projects="" carrier="no"
+  route_iface="$(default_iface)"
+  iface="$(wired_iface)"
+  [[ -n $iface && $(cat "/sys/class/net/$iface/carrier" 2>/dev/null) == 1 ]] && carrier="yes"
+  [[ -n $iface && -r /sys/class/net/$iface/address ]] && mac="$(<"/sys/class/net/$iface/address")"
+  if [[ -n $iface ]] && command -v ethtool >/dev/null; then
+    wol="$(ethtool "$iface" 2>/dev/null | awk '/^[[:space:]]*Wake-on:/ { print $2 }')"
+    [[ -z $wol ]] && wol="unknown"
+  fi
+  # ethtool needs root to show Wake-on. Without root, fall back to the
+  # NetworkManager setting, which normal users can read.
+  if [[ $wol == unknown ]] && command -v nmcli >/dev/null; then
+    local conn nm_wol
+    conn="$(nm_connection "$iface")"
+    if [[ -n $conn ]]; then
+      nm_wol="$(nmcli -g 802-3-ethernet.wake-on-lan connection show "$conn" 2>/dev/null)"
+      [[ $nm_wol == *magic* ]] && wol="g"
+    fi
+  fi
+  local d
+  for d in "$HOME/Projects" "$HOME/projects" "$HOME/code" "$HOME/src" "$HOME/dev"; do
+    if [[ -d $d ]]; then projects="$d"; break; fi
+  done
+
+  echo "user=${USER:-$(id -un)}"
+  echo "home=$HOME"
+  echo "machine_id=$(cat /etc/machine-id 2>/dev/null)"
+  echo "iface=$iface"
+  echo "wired=$([[ -n $iface ]] && echo yes || echo no)"
+  echo "carrier=$carrier"
+  echo "route_iface=$route_iface"
+  echo "route_wireless=$([[ -n $route_iface && -d /sys/class/net/$route_iface/wireless ]] && echo yes || echo no)"
+  echo "mac=$mac"
+  echo "wol=$wol"
+  echo "nm_connection=$(nm_connection "$iface")"
+  echo "projects=$projects"
+  echo "pc_remote=$( { [[ -x /usr/local/bin/pc-remote ]] && cmp -s "$DIR/pc-remote" /usr/local/bin/pc-remote && echo current; } \
+    || { [[ -x /usr/local/bin/pc-remote ]] && echo outdated; } || echo missing)"
+  echo "sudoers=$(sudo -n -l /usr/bin/systemctl poweroff >/dev/null 2>&1 && echo yes || echo no)"
+  echo "tmux=$(command -v tmux >/dev/null && echo yes || echo no)"
+  echo "mosh=$(command -v mosh-server >/dev/null && echo yes || echo no)"
+  echo "tmux_conf=$([[ -e $HOME/.tmux.conf ]] && echo yes || echo no)"
+  echo "sleep_masked=$([[ $(systemctl is-enabled sleep.target 2>/dev/null) == masked ]] && echo yes || echo no)"
+  echo "sshd=$(systemctl is-active sshd 2>/dev/null || systemctl is-active ssh 2>/dev/null || true)"
+  echo "ufw=$( { command -v ufw >/dev/null && systemctl is-active ufw 2>/dev/null; } || echo absent)"
+  echo "pkg=$( { command -v pacman >/dev/null && echo pacman; } || { command -v apt-get >/dev/null && echo apt; } || echo unknown)"
+  echo "ollama=$(curl -fs --max-time 2 http://127.0.0.1:11434/api/version >/dev/null 2>&1 && echo yes || echo no)"
+}
+
+user_apply() {
+  case "${1:-}" in
+    tmux)
+      if [[ -e $HOME/.tmux.conf ]]; then
+        echo "Kept existing ~/.tmux.conf"
+      else
+        printf 'set -g mouse on\nset -g history-limit 50000\nset -g default-terminal "tmux-256color"\n' \
+          > "$HOME/.tmux.conf"
+        echo "Wrote ~/.tmux.conf"
+      fi
+      ;;
+    *) echo "Unknown user step: ${1:-}" >&2; return 2 ;;
+  esac
+}
+
+# Prints numbered ufw rules that expose SSH or remote desktop to everyone.
+risky_rules() {
+  ufw status numbered 2>/dev/null \
+    | grep -E 'ALLOW' | grep -E 'Anywhere' | grep -v 'tailscale0' \
+    | grep -E '^\[ *[0-9]+\] +(22|22/tcp|3389|3389/tcp|5900|5900/tcp|OpenSSH)( |\(v6\))'
+}
+
+apply_step() {
+  local step=$1 user=$2
+  case $step in
+    pc-remote)
+      install -m 755 "$DIR/pc-remote" /usr/local/bin/pc-remote
+      echo "Installed /usr/local/bin/pc-remote"
+      ;;
+    sudoers)
+      local tmp
+      tmp="$(mktemp)"
+      printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff, /usr/bin/systemctl reboot\n' \
+        "$user" > "$tmp"
+      if visudo -cf "$tmp" >/dev/null; then
+        install -m 440 -o root -g root "$tmp" "$SUDOERS_FILE"
+        echo "Installed $SUDOERS_FILE"
+      else
+        echo "Error: generated sudoers rule did not validate." >&2
+        rm -f "$tmp"
+        return 1
+      fi
+      rm -f "$tmp"
+      ;;
+    packages)
+      if command -v pacman >/dev/null; then
+        pacman -S --needed --noconfirm tmux mosh ethtool
+      elif command -v apt-get >/dev/null; then
+        apt-get install -y tmux mosh ethtool
+      else
+        echo "Unknown package manager: install tmux, mosh and ethtool manually." >&2
+        return 1
+      fi
+      ;;
+    wol)
+      local iface conn
+      iface="$(wired_iface)"
+      [[ -n $iface ]] || { echo "No wired network card found; Wake-on-LAN needs Ethernet." >&2; return 1; }
+      conn="$(nm_connection "$iface")"
+      if [[ -n $conn ]]; then
+        nmcli connection modify "$conn" 802-3-ethernet.wake-on-lan magic
+        echo "Enabled Wake-on-LAN on NetworkManager connection '$conn'"
+      fi
+      if command -v ethtool >/dev/null; then
+        ethtool -s "$iface" wol g && echo "Enabled Wake-on-LAN on $iface (ethtool)"
+      fi
+      ;;
+    nosleep)
+      systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+      ;;
+    firewall)
+      command -v ufw >/dev/null || { echo "ufw is not installed, skipping." >&2; return 0; }
+      # Tailscale rules first, so an SSH session over Tailscale is never cut.
+      ufw allow in on tailscale0 to any port 22 proto tcp
+      ufw allow in on tailscale0 to any port 60000:61000 proto udp
+      local risky a
+      risky="$(risky_rules || true)"
+      if [[ -n $risky ]]; then
+        echo "These rules expose SSH or remote desktop to everyone on your network:"
+        printf '%s\n' "$risky" | sed 's/^/    /'
+        read -r -p "Remove them? [Y/n] " a </dev/tty || a="n"
+        if [[ -z $a || ${a,,} == y* ]]; then
+          apply_step firewall-harden "$user"
+        else
+          echo "Kept them."
+        fi
+      fi
+      ufw default deny incoming
+      ufw --force enable
+      ;;
+    firewall-harden)
+      command -v ufw >/dev/null || return 0
+      local n
+      # Delete from the highest number down so numbering stays valid.
+      while read -r n; do
+        [[ -n $n ]] && ufw --force delete "$n"
+      done < <(risky_rules | sed -E 's/^\[ *([0-9]+)\].*/\1/' | sort -rn)
+      ;;
+    firewall-audit)
+      command -v ufw >/dev/null || return 0
+      risky_rules || true
+      ;;
+    *)
+      echo "Unknown step: $step" >&2
+      return 2
+      ;;
+  esac
+}
+
+cmd_apply() {
+  if (( EUID != 0 )); then
+    echo "apply must run as root (use sudo)." >&2
+    return 1
+  fi
+  local user=""
+  if [[ ${1:-} == --user ]]; then user=$2; shift 2; fi
+  [[ -n $user ]] || { echo "--user is required" >&2; return 2; }
+  local step rc=0
+  for step in "$@"; do
+    echo "--- $step"
+    apply_step "$step" "$user" || rc=1
+  done
+  return $rc
+}
+
+case "${1:-}" in
+  check)      cmd_check ;;
+  user-apply) shift; user_apply "$@" ;;
+  apply)      shift; cmd_apply "$@" ;;
+  *)          sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

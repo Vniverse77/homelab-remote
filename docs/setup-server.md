@@ -1,5 +1,8 @@
 # Server setup
 
+> The easiest way is the wizard: run `homelab setup` on the laptop. This page describes
+> the same steps done by hand.
+
 The server is the always-on (or wake-on-demand) machine, usually the one with the GPU.
 
 ## 1. Install

@@ -1,5 +1,8 @@
 # Laptop setup
 
+> The easiest way is the wizard: run `homelab setup` on the laptop. This page describes
+> the same steps done by hand.
+
 The laptop stays at home most of the time, plugged in and always on. It sends the
 Wake-on-LAN packet, so it must be on the same LAN as the server for `pc on` to work.
 
