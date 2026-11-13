@@ -1,8 +1,32 @@
-# homelab-remote
+<div align="center">
 
-Control your home PC from anywhere and keep working on it while you are away,
-using a laptop that lives at home and a phone in your pocket. Everything runs
-over [Tailscale](https://tailscale.com); no ports are opened to the internet.
+```
+ _                          _       _                                    _
+| |__   ___  _ __ ___   ___| | __ _| |__        _ __ ___ _ __ ___   ___ | |_ ___
+| '_ \ / _ \| '_ ` _ \ / _ \ |/ _` | '_ \ _____| '__/ _ \ '_ ` _ \ / _ \| __/ _ \
+| | | | (_) | | | | | |  __/ | (_| | |_) |_____| | |  __/ | | | | | (_) | ||  __/
+|_| |_|\___/|_| |_| |_|\___|_|\__,_|_.__/      |_|  \___|_| |_| |_|\___/ \__\___|
+```
+
+**Wake your home PC, shut it down and keep working on it, from anywhere.**
+A laptop that stays at home is the gateway, your phone is the remote, Tailscale is the wire.
+
+[![AUR](https://img.shields.io/aur/version/homelab-remote?label=AUR&logo=archlinux&color=1793d1)](https://aur.archlinux.org/packages/homelab-remote)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![shellcheck](https://github.com/Vniverse77/homelab-remote/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/Vniverse77/homelab-remote/actions/workflows/shellcheck.yml)
+
+```console
+$ yay -S homelab-remote
+$ homelab setup        # guided TUI: laptop, server, camera, phone
+$ pc on                # wake the server, wait until it answers
+$ dev                  # jump into a tmux session on it (mosh)
+```
+
+</div>
+
+## How it fits together
+
+Everything runs over [Tailscale](https://tailscale.com); no ports are opened to the internet.
 
 ```
    Phone (Termux:Widget)              Laptop (always on at home)            Home server (GPU box)
@@ -12,6 +36,23 @@ over [Tailscale](https://tailscale.com); no ports are opened to the internet.
   | Server Dev (mosh)    |---+    | webcam stream (RTSP)      |-------->| coding agents, jobs  |
   +----------------------+   |    +---------------------------+         +----------------------+
                              +--------------------------------- mosh ---------------^
+```
+
+## Install
+
+**Arch Linux / CachyOS / Manjaro (AUR):**
+
+```bash
+yay -S homelab-remote      # or: paru -S homelab-remote
+homelab setup
+```
+
+**Any other Linux (from source):**
+
+```bash
+git clone https://github.com/Vniverse77/homelab-remote.git
+cd homelab-remote
+./bin/homelab setup
 ```
 
 ## Features
@@ -57,12 +98,6 @@ Details: [docs/security.md](docs/security.md)
 Everything is set up from the laptop. Make sure Tailscale is connected on the laptop
 and the server, and that you can log in to the server with your password once.
 
-```bash
-git clone https://github.com/<you>/homelab-remote.git
-cd homelab-remote
-./bin/homelab setup
-```
-
 The wizard:
 
 - installs the commands into `~/.local/bin`
@@ -97,7 +132,8 @@ For a non-interactive install use `./install.sh laptop` and `./install.sh server
 - [x] Phone widgets with a password gate
 - [x] Setup wizard (`homelab setup`) and health check (`homelab doctor`)
 - [ ] **Remote AI** - use the server's GPU and local / free models from the laptop and phone *(coming soon)*
-- [ ] AUR package *(planned)*
+- [x] AUR package ([homelab-remote](https://aur.archlinux.org/packages/homelab-remote))
+- [ ] Always-on servers without Wake-on-LAN (Raspberry Pi, laptops on Wi-Fi)
 
 ## A note on the camera
 
