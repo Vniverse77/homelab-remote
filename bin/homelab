@@ -9,7 +9,7 @@
 # what it is about to do before every step and asks for confirmation.
 set -uo pipefail
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 CONFIG="${HOMELAB_CONFIG:-$HOME/.config/homelab-remote/config}"
 SELF="$(readlink -f "$0")"
 BIN_DIR="$(dirname "$SELF")"
@@ -330,6 +330,8 @@ step_install_files() {
 
   if [[ $SHARE == "$INSTALL_SHARE" && $BIN_DIR == "$INSTALL_BIN" ]]; then
     ok "Commands are already installed in $INSTALL_BIN"
+  elif [[ $SHARE == /usr/share/homelab-remote && $BIN_DIR == /usr/bin ]]; then
+    ok "Commands are installed system-wide by the package manager (/usr/bin)"
   elif plan "Copy commands and data files" \
       "pc, dev, camera, pc-phone, homelab -> $INSTALL_BIN" \
       "server helpers and extras -> $INSTALL_SHARE"; then

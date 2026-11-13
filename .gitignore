@@ -4,3 +4,7 @@ config
 camera/password
 *.pem
 id_*
+packaging/aur/*.tar.gz
+packaging/aur/*.pkg.tar.zst
+packaging/aur/src/
+packaging/aur/pkg/
