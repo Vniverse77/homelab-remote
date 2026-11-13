@@ -1,5 +1,3 @@
-<div align="center">
-
 ```
  _                          _       _                                    _
 | |__   ___  _ __ ___   ___| | __ _| |__        _ __ ___ _ __ ___   ___ | |_ ___
@@ -8,6 +6,8 @@
 |_| |_|\___/|_| |_| |_|\___|_|\__,_|_.__/      |_|  \___|_| |_| |_|\___/ \__\___|
 ```
 
+<div align="center">
+
 **Wake your home PC, shut it down and keep working on it, from anywhere.**
 A laptop that stays at home is the gateway, your phone is the remote, Tailscale is the wire.
 
@@ -15,14 +15,14 @@ A laptop that stays at home is the gateway, your phone is the remote, Tailscale 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![shellcheck](https://github.com/Vniverse77/homelab-remote/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/Vniverse77/homelab-remote/actions/workflows/shellcheck.yml)
 
+</div>
+
 ```console
 $ yay -S homelab-remote
 $ homelab setup        # guided TUI: laptop, server, camera, phone
 $ pc on                # wake the server, wait until it answers
 $ dev                  # jump into a tmux session on it (mosh)
 ```
-
-</div>
 
 ## How it fits together
 
