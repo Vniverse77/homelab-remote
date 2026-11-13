@@ -18,7 +18,7 @@ optdepends=('tailscale: required for every remote connection'
             'mediamtx: camera RTSP server (AUR)'
             'ufw: firewall rules for the camera port')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('213118d00fb74f4e037686afac0b5711aa91f340b9dc15df36d9e37173adcb0b')
 
 package() {
 	cd "$pkgname-$pkgver"
